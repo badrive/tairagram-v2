@@ -1,0 +1,89 @@
+name: IG to Discord Scraper
+
+on:
+  schedule:
+    # Offset from :00/:30 — GitHub silently drops scheduled events under
+    # load, and the top of the hour is the most congested slot.
+   - cron: '9,39 * * * *'  # when GitHub's own scheduler skips a slot.
+  repository_dispatch:
+    types: [run-scraper]
+  workflow_dispatch:
+    inputs:
+      seed_only:
+        description: 'Record each account as up to date without posting to Discord'
+        type: boolean
+        default: false
+      batch_size:
+        description: 'How many accounts to check this run (blank = 6)'
+        type: string
+        default: ''
+
+# Two runs pushing state at once would race on the same branch. Only ONE run
+# can sit pending per group — anything queued behind it is cancelled, which
+# is why the job has a hard timeout.
+concurrency:
+  group: ig-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape-and-post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      # fetch-depth: 0 because the push step rebases; rebasing a shallow
+      # clone is unreliable.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          # stdlib only — no go.sum, so dependency caching has nothing to do
+          cache: false
+
+      - name: Run scraper
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Comma-separated usernames. A secret (not a variable, not a file):
+          # the repo and its Actions logs are public.
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+          SEED_ONLY: ${{ inputs.seed_only && '1' || '0' }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+        run: go run .
+
+      # Must run even when the scraper exits non-zero: it still posted to
+      # Discord for the accounts it got through, and dropping that state
+      # would re-send those posts next run.
+      - name: Commit and push state
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add state.json 2>/dev/null || true
+
+          if git diff --staged --quiet; then
+            echo "No state changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Update state"
+
+          # Retry: a rejected push loses this run's state and re-sends posts.
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash && git push; then
+              echo "Pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "Push attempt $attempt failed, retrying..."
+            sleep 5
+          done
+
+          echo "Could not push state after 3 attempts"
+          exit 1

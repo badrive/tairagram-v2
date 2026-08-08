@@ -1,0 +1,4 @@
+# local dev only — the workflow gets the webhook from a repo secret
+.env
+tairagram
+*.exe
